@@ -490,7 +490,7 @@ final class AudioBridge: @unchecked Sendable {
             throw AudioBridgeError.encoderOpenFailed(code: fillRet)
         }
         if packsPCM {
-            let pcmRet = Self.describePackedPCM(cp, layout: &enc.pointee.ch_layout, swapped: swapsSurroundPairs)
+            let pcmRet = Self.describePackedPCM(cp, layout: &enc.pointee.ch_layout)
             if pcmRet < 0 {
                 cleanup()
                 throw AudioBridgeError.encoderOpenFailed(code: pcmRet)
@@ -1313,8 +1313,8 @@ final class AudioBridge: @unchecked Sendable {
      * The swap moves samples, not their values, so the lossless bridge stays bit-exact per channel.
      */
     ///
-    /// Packed PCM is swapped too and labelled in that order (`describePackedPCM`), the CoreAudio 7.1 order
-    /// the rendered bed's `chnl` uses, so samples and labels agree on one measured convention.
+    /// Packed PCM is swapped the same way, so its samples are in the measured FLAC order, and keeps the
+    /// resampler's labels (`describePackedPCM`).
     static func writesSurroundPairsSwapped(codecID: AVCodecID, channels: Int32) -> Bool {
         (codecID == AV_CODEC_ID_FLAC || codecID == AV_CODEC_ID_PCM_S24LE) && channels == 8
     }
@@ -1322,14 +1322,17 @@ final class AudioBridge: @unchecked Sendable {
     /**
      * The muxer's codecpar for packed PCM, as `PCMBedPacker.makeCodecpar` describes the rendered bed:
      * `pcm_s24le`, 24 bits, 1024-frame packets and a custom channel layout movenc writes as `chnl`. The
-     * labels are the FIFO's channels in the order the packets carry them: the resampler's (`layout`, the
-     * encoder context's native default), with the 7.1 surround pairs swapped when `swapped`.
+     * labels are the resampler's (`layout`, the encoder context's native default), FL FR FC LFE BL BR SL SR
+     * for 7.1, even though the 7.1 samples are written with their surround pairs swapped
+     * (`writesSurroundPairsSwapped`). Labelled in the swapped order (SL SR in channels 5-6, BL BR in 7-8),
+     * the side and rear pairs traded places at the receiver: tvOS played what `chnl` called the side pair from
+     * the rear speakers and the rear pair from the sides (reported on TrueHD 7.1). With the resampler's labels
+     * the stream is the swapped FLAC stream that was measured right, plus labels.
      */
     static func describePackedPCM(_ cp: UnsafeMutablePointer<AVCodecParameters>,
-                                  layout: UnsafeMutablePointer<AVChannelLayout>, swapped: Bool) -> Int32 {
+                                  layout: UnsafeMutablePointer<AVChannelLayout>) -> Int32 {
         let channels = layout.pointee.nb_channels
-        var ids: [AVChannel] = (0..<channels).map { av_channel_layout_channel_from_index(layout, UInt32($0)) }
-        if swapped, ids.count == 8 { ids.swapAt(4, 6); ids.swapAt(5, 7) }
+        let ids: [AVChannel] = (0..<channels).map { av_channel_layout_channel_from_index(layout, UInt32($0)) }
         cp.pointee.codec_type = AVMEDIA_TYPE_AUDIO
         cp.pointee.codec_id = AV_CODEC_ID_PCM_S24LE
         cp.pointee.codec_tag = 0

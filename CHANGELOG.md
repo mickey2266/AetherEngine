@@ -32,7 +32,10 @@ the public-API contract.
   `chnl` box naming each channel (`ipcm` in the master's CODECS), the way the rendered Atmos bed already
   reaches receivers channel for channel with the setting off. 24 bits carries TrueHD and DTS-HD MA bit for
   bit; 7.1 at 48 kHz is 9.2 Mbit/s over the loopback. No PCM encoder is opened, so the FFmpeg build needs
-  none. Stereo stays FLAC, and `.surroundCompat` is unchanged. Not yet measured on the device.
+  none. Stereo stays FLAC, and `.surroundCompat` is unchanged. 7.1 keeps the FLAC bridge's measured sample
+  order (surround pairs swapped) but is labelled in the resampler's order, FL FR FC LFE BL BR SL SR: labelled
+  in the swapped order as first written, TrueHD 7.1 played its side and rear surrounds from each other's
+  speakers on the device.
 
 ## [7.54.0] - 2026-11-01
 
