@@ -36,10 +36,13 @@ struct Issue395StereoBridgeEncoderTests {
         }
     }
 
-    @Test("lossless is FLAC at every channel count")
-    func losslessIsAlwaysFLAC() {
-        for channels in Int32(1)...8 {
+    @Test("lossless is FLAC up to stereo and labelled 24-bit PCM for surround")
+    func losslessIsFLACOrPCM() {
+        for channels in Int32(1)...2 {
             #expect(AudioBridge.bridgeEncoder(for: .lossless, sourceChannels: channels) == AV_CODEC_ID_FLAC)
+        }
+        for channels in Int32(3)...8 {
+            #expect(AudioBridge.bridgeEncoder(for: .lossless, sourceChannels: channels) == AV_CODEC_ID_PCM_S24LE)
         }
     }
 

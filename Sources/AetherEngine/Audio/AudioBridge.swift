@@ -54,14 +54,18 @@ final class AudioBridge: @unchecked Sendable {
     /// The input is the SOURCE's channel count, never the current output route. Route-dependent bridging
     /// was measured wrong in #34 (AVPlayer downmixes EAC3+JOC natively over A2DP) and removed; this is a
     /// static property of the source, so a route change cannot make it disagree with itself mid-session.
+    ///
+    /// `.lossless` surround is 24-bit linear PCM with a labelled channel layout, not FLAC (see
+    /// `packsPCM`); stereo stays FLAC.
     static func bridgeEncoder(for mode: Mode, sourceChannels: Int32) -> AVCodecID {
         switch mode {
-        case .lossless:       return AV_CODEC_ID_FLAC
+        case .lossless:       return sourceChannels > 2 ? AV_CODEC_ID_PCM_S24LE : AV_CODEC_ID_FLAC
         case .surroundCompat: return sourceChannels > 2 ? AV_CODEC_ID_EAC3 : AV_CODEC_ID_FLAC
         }
     }
 
-    /// The other encoder a build can carry, for the #165 cascade when the resolved one is absent.
+    /// The other encoder a build can carry, for the #165 cascade when the resolved one is absent. PCM is
+    /// packed by the bridge itself and is never absent, so it has no alternative of its own.
     static func alternateEncoder(to missing: AVCodecID) -> AVCodecID {
         missing == AV_CODEC_ID_EAC3 ? AV_CODEC_ID_FLAC : AV_CODEC_ID_EAC3
     }
@@ -73,6 +77,7 @@ final class AudioBridge: @unchecked Sendable {
     /// Pure and named rather than inline, because docs/formats.md quotes both numbers and
     /// `DocumentedConstantsTests` pins them: a cap that moves without the sentence moving with it
     /// is a doc that lies in a paragraph that still reads perfectly.
+    /// PCM carries 8 as FLAC does.
     static func maxEncodedChannels(for encoder: AVCodecID) -> Int32 {
         encoder == AV_CODEC_ID_EAC3 ? 6 : 8
     }
@@ -179,8 +184,25 @@ final class AudioBridge: @unchecked Sendable {
     /// AV_CODEC_CAP_SMALL_LAST_FRAME but not VARIABLE_FRAME_SIZE, so non-final frames must hit frame_size exactly
     /// (~4608 @48kHz); EAC3 decodes 1536 samples/packet, so without the FIFO we'd hit -22 EINVAL on the first send.
     private var fifo: OpaquePointer?
-    /// 7.1 FLAC is written with its surround pairs in CoreMedia's order (`writesSurroundPairsSwapped`).
+    /// 7.1 is written with its surround pairs in CoreMedia's order (`writesSurroundPairsSwapped`).
     private var swapsSurroundPairs = false
+
+    /**
+     * `.lossless` surround leaves as 24-bit linear PCM the bridge packs itself, muxed as `ipcm` with a
+     * `chnl` box naming every channel, rather than FLAC. A FLAC track carries no channel layout, and
+     * with tvOS's Continuous Audio Connection off an AVPlayer playing one never switched a stereo HDMI
+     * link to multichannel: on an Apple TV 4K into a Samsung HW-Q990F the soundbar showed stereo PCM
+     * from a 7.1 TrueHD track until another app (Infuse, which hands tvOS labelled PCM) had switched the
+     * link, and multichannel from then on. Labelled PCM through AVPlayer is what the rendered Atmos bed
+     * already sends (`PCMBedPacker`), measured reaching a receiver channel for channel with the setting
+     * off. 24 bits carries TrueHD and DTS-HD MA bit for bit. No libavcodec encoder is opened: the packets
+     * are the FIFO's samples, so the build needs no PCM encoder and nothing can be missing from it.
+     */
+    private var packsPCM = false
+
+    /// Frames per packed PCM packet, as `PCMBedPacker` cuts its packets.
+    static let pcmFramesPerPacket: Int32 = 1024
+    static let pcmBytesPerPackedSample = 3
 
     /// Serializes the public mutators (feed/flush/startSegment/noteTimelineJump/close) against each
     /// other. On a producer restart whose old pump did not exit within the 5s budget (slow/remote
@@ -368,11 +390,13 @@ final class AudioBridge: @unchecked Sendable {
         let encoderCodecID = forcedEncoder
             ?? Self.bridgeEncoder(for: mode, sourceChannels: shapedChannels)
         outputCodecID = encoderCodecID
+        packsPCM = encoderCodecID == AV_CODEC_ID_PCM_S24LE
         if encoderCodecID == AV_CODEC_ID_EAC3 {
             pcmSampleFmt = AV_SAMPLE_FMT_FLTP
             pcmBytesPerSample = 4
             pcmBitsPerRawSample = 32
-        } else if isLosslessSource {
+        } else if packsPCM || isLosslessSource {
+            // Packed PCM keeps the top 24 bits of each S32 sample, whatever the source.
             pcmSampleFmt = AV_SAMPLE_FMT_S32
             pcmBytesPerSample = 4
             pcmBitsPerRawSample = 24
@@ -381,9 +405,15 @@ final class AudioBridge: @unchecked Sendable {
             pcmBytesPerSample = 2
             pcmBitsPerRawSample = 16
         }
-        guard let encCodec = avcodec_find_encoder(encoderCodecID) else {
-            cleanup()
-            throw AudioBridgeError.encoderNotFound(codecID: encoderCodecID)
+        // Packed PCM has no codec: its context only carries the output format the resampler, the FIFO and
+        // the codecpar read, and is never opened.
+        var encCodec: UnsafePointer<AVCodec>?
+        if !packsPCM {
+            guard let found = avcodec_find_encoder(encoderCodecID) else {
+                cleanup()
+                throw AudioBridgeError.encoderNotFound(codecID: encoderCodecID)
+            }
+            encCodec = found
         }
         guard let enc = avcodec_alloc_context3(encCodec) else {
             cleanup()
@@ -406,7 +436,7 @@ final class AudioBridge: @unchecked Sendable {
         let encoderName = avcodec_get_name(encoderCodecID).map { String(cString: $0) } ?? "?"
         let logBitRate: String = encoderCodecID == AV_CODEC_ID_EAC3
             ? "\(Int64(nChannels) * 128) kbps"
-            : "VBR"
+            : packsPCM ? "\(Int64(nChannels) * Int64(sampleRate) * 24 / 1000) kbps (24-bit PCM)" : "VBR"
         EngineLog.emit(
             "[AudioBridge] init: mode=\(mode.rawValue) encoder=\(encoderName)"
             + (forcedEncoder != nil ? " (forced)" : "")
@@ -434,10 +464,17 @@ final class AudioBridge: @unchecked Sendable {
             cleanup()
             throw AudioBridgeError.encoderOpenFailed(code: layoutCopyRet)
         }
-        let encOpenRet = avcodec_open2(enc, encCodec, nil)
-        guard encOpenRet >= 0 else {
-            cleanup()
-            throw AudioBridgeError.encoderOpenFailed(code: encOpenRet)
+        if packsPCM {
+            enc.pointee.codec_type = AVMEDIA_TYPE_AUDIO
+            enc.pointee.codec_id = AV_CODEC_ID_PCM_S24LE
+            // The drain's chunk: `drainFIFOIntoEncoder` and the silence gate read frame_size.
+            enc.pointee.frame_size = Self.pcmFramesPerPacket
+        } else {
+            let encOpenRet = avcodec_open2(enc, encCodec, nil)
+            guard encOpenRet >= 0 else {
+                cleanup()
+                throw AudioBridgeError.encoderOpenFailed(code: encOpenRet)
+            }
         }
         encoderTimeBase = AVRational(num: 1, den: sampleRate)
 
@@ -451,6 +488,13 @@ final class AudioBridge: @unchecked Sendable {
         if fillRet < 0 {
             cleanup()
             throw AudioBridgeError.encoderOpenFailed(code: fillRet)
+        }
+        if packsPCM {
+            let pcmRet = Self.describePackedPCM(cp, layout: &enc.pointee.ch_layout, swapped: swapsSurroundPairs)
+            if pcmRet < 0 {
+                cleanup()
+                throw AudioBridgeError.encoderOpenFailed(code: pcmRet)
+            }
         }
 
         // 5. Resampler input format: seed from the decoder ctx if avformat_find_stream_info already resolved it
@@ -774,9 +818,9 @@ final class AudioBridge: @unchecked Sendable {
         //    frame (requireFull: false pads/short-frames it).
         try? drainFIFOIntoEncoder(enc: enc, fifo: fifoPtr, requireFull: false, results: &results)
 
-        // 3. Flush the encoder's internal delay.
-        _ = avcodec_send_frame(enc, nil)
-        while true {
+        // 3. Flush the encoder's internal delay. Packed PCM has no encoder and nothing delayed.
+        if !packsPCM { _ = avcodec_send_frame(enc, nil) }
+        while !packsPCM {
             guard let outPkt = trackedPacketAlloc() else { break }
             let recvRet = avcodec_receive_packet(enc, outPkt)
             guard recvRet >= 0 else {
@@ -819,6 +863,8 @@ final class AudioBridge: @unchecked Sendable {
     /// reallocated. On any failure the old context stays; the next feed() then throws loudly instead of
     /// silently emitting nothing. Runs under opLock (callers hold it).
     private func rebuildEncoderAfterEOFDrain() {
+        // Packed PCM keeps no encoder state, so an EOF drain leaves nothing to rebuild.
+        guard !packsPCM else { return }
         guard let oldEnc = encoderCtx else { return }
         let encoderCodecID: AVCodecID = outputCodecID
         guard let encCodec = avcodec_find_encoder(encoderCodecID),
@@ -1266,8 +1312,64 @@ final class AudioBridge: @unchecked Sendable {
      * remuxed to FLAC in CoreMedia's order: every call came from its own speaker, as Infuse plays the TrueHD.
      * The swap moves samples, not their values, so the lossless bridge stays bit-exact per channel.
      */
+    ///
+    /// Packed PCM is swapped too and labelled in that order (`describePackedPCM`), the CoreAudio 7.1 order
+    /// the rendered bed's `chnl` uses, so samples and labels agree on one measured convention.
     static func writesSurroundPairsSwapped(codecID: AVCodecID, channels: Int32) -> Bool {
-        codecID == AV_CODEC_ID_FLAC && channels == 8
+        (codecID == AV_CODEC_ID_FLAC || codecID == AV_CODEC_ID_PCM_S24LE) && channels == 8
+    }
+
+    /**
+     * The muxer's codecpar for packed PCM, as `PCMBedPacker.makeCodecpar` describes the rendered bed:
+     * `pcm_s24le`, 24 bits, 1024-frame packets and a custom channel layout movenc writes as `chnl`. The
+     * labels are the FIFO's channels in the order the packets carry them: the resampler's (`layout`, the
+     * encoder context's native default), with the 7.1 surround pairs swapped when `swapped`.
+     */
+    static func describePackedPCM(_ cp: UnsafeMutablePointer<AVCodecParameters>,
+                                  layout: UnsafeMutablePointer<AVChannelLayout>, swapped: Bool) -> Int32 {
+        let channels = layout.pointee.nb_channels
+        var ids: [AVChannel] = (0..<channels).map { av_channel_layout_channel_from_index(layout, UInt32($0)) }
+        if swapped, ids.count == 8 { ids.swapAt(4, 6); ids.swapAt(5, 7) }
+        cp.pointee.codec_type = AVMEDIA_TYPE_AUDIO
+        cp.pointee.codec_id = AV_CODEC_ID_PCM_S24LE
+        cp.pointee.codec_tag = 0
+        cp.pointee.frame_size = pcmFramesPerPacket
+        cp.pointee.bits_per_raw_sample = 24
+        cp.pointee.bits_per_coded_sample = 24
+        cp.pointee.block_align = channels * Int32(pcmBytesPerPackedSample)
+        cp.pointee.bit_rate = Int64(channels) * Int64(pcmBytesPerPackedSample * 8) * Int64(cp.pointee.sample_rate)
+        av_channel_layout_uninit(&cp.pointee.ch_layout)
+        let ret = av_channel_layout_custom_init(&cp.pointee.ch_layout, channels)
+        guard ret >= 0 else { return ret }
+        for (i, id) in ids.enumerated() { cp.pointee.ch_layout.u.map[i].id = id }
+        return 0
+    }
+
+    /// One packet of interleaved signed 24-bit little-endian PCM from `frames` S32 frames: each sample's top
+    /// 24 bits, which for a 24-bit or shorter source is every bit it has. Stamped in `encoderTimeBase`.
+    private func packPCM(_ samples: UnsafeMutablePointer<UInt8>, frames: Int32, channels: Int32,
+                         pts: Int64) -> UnsafeMutablePointer<AVPacket>? {
+        let count = Int(frames) * Int(channels)
+        let size = count * Self.pcmBytesPerPackedSample
+        guard let pkt = trackedPacketAlloc() else { return nil }
+        guard av_new_packet(pkt, Int32(size)) >= 0, let out = pkt.pointee.data else {
+            var p: UnsafeMutablePointer<AVPacket>? = pkt
+            trackedPacketFree(&p)
+            return nil
+        }
+        // S32 is little-endian on every Apple platform: bytes 1-3 of each sample are its top 24 bits.
+        for i in 0..<count {
+            let src = samples + i * 4
+            let dst = out + i * 3
+            dst[0] = src[1]
+            dst[1] = src[2]
+            dst[2] = src[3]
+        }
+        pkt.pointee.pts = pts
+        pkt.pointee.dts = pts
+        pkt.pointee.duration = Int64(frames)
+        pkt.pointee.flags |= AV_PKT_FLAG_KEY
+        return pkt
     }
 
     /// Swaps channels 5-6 with 7-8 in place in interleaved 8-channel PCM (`writesSurroundPairsSwapped`).
@@ -1338,6 +1440,15 @@ final class AudioBridge: @unchecked Sendable {
             of.pointee.nb_samples = readSamples
             of.pointee.pts = nextEncoderPTS
             nextEncoderPTS += Int64(readSamples)
+
+            if packsPCM {
+                guard let samples = of.pointee.data.0,
+                      let pkt = packPCM(samples, frames: readSamples, channels: nChannels, pts: of.pointee.pts) else { break }
+                outputBytesLifetime += Int64(pkt.pointee.size)
+                stats.packetsEmitted += 1
+                results.append(pkt)
+                continue
+            }
 
             // EOF is NOT exempt: a draining encoder here means the EOF-drain latch was bypassed (#99);
             // swallowing it starved the muxer of audio with zero diagnostics.

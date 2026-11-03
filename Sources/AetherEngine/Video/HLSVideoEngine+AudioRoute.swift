@@ -389,8 +389,11 @@ extension HLSVideoEngine {
                     // not from the mode: `.surroundCompat` on a stereo source produces fLaC, and a master
                     // playlist that advertises ec-3 for a FLAC track is a load failure, not a cosmetic slip.
                     let isEAC3Out = bridge.outputCodecID == AV_CODEC_ID_EAC3
-                    let hlsCodec = isEAC3Out ? "ec-3" : "fLaC"
-                    let pipelineLabel = "\(sourceCodecLabel) → \(isEAC3Out ? "EAC3" : "FLAC") bridge"
+                    let isPCMOut = bridge.outputCodecID == AV_CODEC_ID_PCM_S24LE
+                    // Packed PCM is muxed as `ipcm`, the rendered bed's sample entry.
+                    let hlsCodec = isEAC3Out ? "ec-3" : isPCMOut ? "ipcm" : "fLaC"
+                    let outName = isEAC3Out ? "EAC3" : isPCMOut ? "PCM" : "FLAC"
+                    let pipelineLabel = "\(sourceCodecLabel) → \(outName) bridge"
                     audioHLSCodecs = hlsCodec
                     self.audioPipelineDescription = shapes ? pipelineLabel + " (shaped)" : pipelineLabel
                     self.audioDelivery = .bridged

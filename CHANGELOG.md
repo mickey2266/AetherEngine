@@ -22,6 +22,18 @@ the public-API contract.
   swapped played every call from its own speaker, as Infuse plays the TrueHD. A 7.1 FLAC source that
   stream-copies is unchanged and still plays swapped.
 
+### Changed
+
+- **`.lossless` surround is 24-bit linear PCM with a labelled channel layout, not FLAC.** With tvOS's
+  Continuous Audio Connection off, an AVPlayer playing the FLAC bridge's track, which carries no channel
+  layout, never switched a stereo HDMI link to multichannel: on an Apple TV 4K into a Samsung HW-Q990F the
+  soundbar showed stereo PCM from a 7.1 TrueHD track until Infuse, which hands tvOS labelled PCM, had
+  switched the link. The bridge now packs the decoded samples itself as `pcm_s24le`, muxed as `ipcm` with a
+  `chnl` box naming each channel (`ipcm` in the master's CODECS), the way the rendered Atmos bed already
+  reaches receivers channel for channel with the setting off. 24 bits carries TrueHD and DTS-HD MA bit for
+  bit; 7.1 at 48 kHz is 9.2 Mbit/s over the loopback. No PCM encoder is opened, so the FFmpeg build needs
+  none. Stereo stays FLAC, and `.surroundCompat` is unchanged. Not yet measured on the device.
+
 ## [7.54.0] - 2026-11-01
 
 ### Added
