@@ -10,7 +10,17 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **7.1 through the FLAC bridge played its side and rear surrounds swapped.** The bridge wrote FLAC's own 7.1
+  order (FL FR FC LFE BL BR SL SR), but the `dfLa` track carries no channel layout and CoreMedia reads 8-channel
+  FLAC in its 7.1 order (L R C LFE Ls Rs Rls Rrs), so the side pair reached the receiver as the rears and the
+  rears as the sides. With tvOS's Continuous Audio Connection on, which drops the rear pair of 7.1 PCM, the side
+  surrounds went silent. The bridge now writes 7.1 FLAC in CoreMedia's order. Measured on an Apple TV 4K into a
+  Samsung HW-Q990F with Dolby's TrueHD 7.1 Channel Check, Continuous Audio Connection off: the clip as the bridge
+  wrote it played sides and rears from each other's speakers, and the same clip remuxed to FLAC with the pairs
+  swapped played every call from its own speaker, as Infuse plays the TrueHD. A 7.1 FLAC source that
+  stream-copies is unchanged and still plays swapped.
 
 ## [7.56.0] - 2026-11-03
 
