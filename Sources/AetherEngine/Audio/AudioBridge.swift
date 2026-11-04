@@ -179,8 +179,6 @@ final class AudioBridge: @unchecked Sendable {
     /// AV_CODEC_CAP_SMALL_LAST_FRAME but not VARIABLE_FRAME_SIZE, so non-final frames must hit frame_size exactly
     /// (~4608 @48kHz); EAC3 decodes 1536 samples/packet, so without the FIFO we'd hit -22 EINVAL on the first send.
     private var fifo: OpaquePointer?
-    /// 7.1 FLAC is written with its surround pairs in CoreMedia's order (`writesSurroundPairsSwapped`).
-    private var swapsSurroundPairs = false
 
     /// Serializes the public mutators (feed/flush/startSegment/noteTimelineJump/close) against each
     /// other. On a producer restart whose old pump did not exit within the 5s budget (slow/remote
@@ -402,7 +400,6 @@ final class AudioBridge: @unchecked Sendable {
         // Cap to encoder max (EAC3 5.1, FLAC 7.1). Above-cap downmix happens automatically inside swr_convert
         // when source layout exceeds the encoder's; the resampler picks Apple-compatible ordering.
         let nChannels: Int32 = min(shapedChannels, Self.maxEncodedChannels(for: encoderCodecID))
-        swapsSurroundPairs = Self.writesSurroundPairsSwapped(codecID: encoderCodecID, channels: nChannels)
         let encoderName = avcodec_get_name(encoderCodecID).map { String(cString: $0) } ?? "?"
         let logBitRate: String = encoderCodecID == AV_CODEC_ID_EAC3
             ? "\(Int64(nChannels) * 128) kbps"
@@ -1256,37 +1253,6 @@ final class AudioBridge: @unchecked Sendable {
         }
     }
 
-    /**
-     * Whether the bridge writes a track's 7.1 surround pairs swapped. FLAC's 7.1 order is FL FR FC LFE BL BR
-     * SL SR, FFmpeg's default and the order the resampler produces, but the `dfLa` track carries no channel
-     * layout and CoreMedia reads 8-channel FLAC in its own 7.1 order, L R C LFE Ls Rs Rls Rrs: channels 5-6 as
-     * the side surrounds and 7-8 as the rear surrounds. Unswapped, the side and rear pairs traded places at the
-     * receiver, and with tvOS's Continuous Audio Connection on, which drops the rear pair, the side pair went
-     * silent instead. Measured on an Apple TV 4K into a Samsung HW-Q990F with Dolby's TrueHD 7.1 Channel Check,
-     * remuxed to FLAC in CoreMedia's order: every call came from its own speaker, as Infuse plays the TrueHD.
-     * The swap moves samples, not their values, so the lossless bridge stays bit-exact per channel.
-     */
-    static func writesSurroundPairsSwapped(codecID: AVCodecID, channels: Int32) -> Bool {
-        codecID == AV_CODEC_ID_FLAC && channels == 8
-    }
-
-    /// Swaps channels 5-6 with 7-8 in place in interleaved 8-channel PCM (`writesSurroundPairsSwapped`).
-    static func swapSurroundPairs(_ data: UnsafeMutablePointer<UInt8>, frames: Int, bytesPerSample: Int) {
-        let stride = 8 * bytesPerSample
-        let pair = 2 * bytesPerSample
-        var scratch = [UInt8](repeating: 0, count: pair)
-        scratch.withUnsafeMutableBytes { temp in
-            guard let tmp = temp.baseAddress else { return }
-            for frame in 0..<frames {
-                let fifthAndSixth = data + frame * stride + 4 * bytesPerSample
-                let seventhAndEighth = fifthAndSixth + pair
-                memcpy(tmp, fifthAndSixth, pair)
-                memcpy(fifthAndSixth, seventhAndEighth, pair)
-                memcpy(seventhAndEighth, tmp, pair)
-            }
-        }
-    }
-
     /// Pull frame_size chunks from the FIFO and encode each. requireFull true stops below frame_size (streaming);
     /// false emits a final short frame for the leftover (flush).
     private func drainFIFOIntoEncoder(
@@ -1331,10 +1297,6 @@ final class AudioBridge: @unchecked Sendable {
                 }
             }
             if readSamples <= 0 { break }
-            if swapsSurroundPairs, !isPlanar, let base = of.pointee.data.0 {
-                Self.swapSurroundPairs(base, frames: Int(readSamples),
-                                       bytesPerSample: Int(pcmBytesPerSample))
-            }
             of.pointee.nb_samples = readSamples
             of.pointee.pts = nextEncoderPTS
             nextEncoderPTS += Int64(readSamples)
