@@ -10,7 +10,15 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **7.1 on the software host played its side and rear surrounds swapped.** `AudioDecoder` writes FFmpeg's 7.1
+  order (FL FR FC LFE BL BR SL SR) and stamped it `MPEG_7_1_C` (L R C LFE Ls Rs Rls Rrs), naming the back pair
+  Ls/Rs. CoreAudio plays Ls/Rs from the side speakers and Rls/Rrs from the rears, so each pair came from the
+  other's speakers. A stereo downmix places both pairs alike, which is why the #401 test passed it. The stamp is
+  now `WAVE_7_1` (L R C LFE Rls Rrs Ls Rs), FFmpeg's order exactly. Measured on an Apple TV 4K into a Samsung
+  HW-Q990F with Dolby's TrueHD 7.1 Channel Check on the software path: the same channels re-encoded to FLAC in
+  each order played right only with the back pair in Rls/Rrs.
 
 ## [7.66.0] - 2026-11-13
 

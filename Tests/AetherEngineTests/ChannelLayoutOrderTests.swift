@@ -35,10 +35,23 @@ final class ChannelLayoutOrderTests: XCTestCase {
     /// CoreAudio's own expansion of a layout, so the comparison is against Apple's data rather
     /// than against a second table of ours.
     private func coreAudioOrder(_ labels: [AudioChannelLabel]) -> [String] {
-        labels.map { Self.name(for: $0) }
+        let sevenOne = labels.count == 8
+        return labels.map { Self.name(for: $0, sevenOne: sevenOne) }
     }
 
-    private static func name(for label: AudioChannelLabel) -> String {
+    /// In 7.1 CoreAudio's Ls/Rs are the side surrounds and Rls/Rrs the rears, measured on an Apple TV
+    /// into a receiver with Dolby's TrueHD 7.1 Channel Check: a stereo downmix places both pairs alike,
+    /// so only the speakers tell them apart. Below 7.1 the one surround pair is FFmpeg's back pair.
+    private static func name(for label: AudioChannelLabel, sevenOne: Bool) -> String {
+        if sevenOne {
+            switch label {
+            case kAudioChannelLabel_LeftSurround: return "SL"
+            case kAudioChannelLabel_RightSurround: return "SR"
+            case kAudioChannelLabel_RearSurroundLeft: return "BL"
+            case kAudioChannelLabel_RearSurroundRight: return "BR"
+            default: break
+            }
+        }
         switch label {
         case kAudioChannelLabel_Left: return "FL"
         case kAudioChannelLabel_Right: return "FR"
@@ -49,13 +62,8 @@ final class ChannelLayoutOrderTests: XCTestCase {
         case kAudioChannelLabel_LeftCenter: return "FLC"
         case kAudioChannelLabel_RightCenter: return "FRC"
         case kAudioChannelLabel_CenterSurround: return "BC"
-        // CoreAudio names the extra 7.1 surround pair "rear" where FFmpeg names it "side".
-        // Measured through a real downmix: both place identically, so the pair is compared by
-        // position rather than by which of the two names each library prefers.
-        case kAudioChannelLabel_LeftSurroundDirect, kAudioChannelLabel_RearSurroundLeft:
-            return "SL"
-        case kAudioChannelLabel_RightSurroundDirect, kAudioChannelLabel_RearSurroundRight:
-            return "SR"
+        case kAudioChannelLabel_LeftSurroundDirect: return "SL"
+        case kAudioChannelLabel_RightSurroundDirect: return "SR"
         case kAudioChannelLabel_Mono: return "MONO"
         default: return "label\(label)"
         }
@@ -165,7 +173,7 @@ final class ChannelLayoutOrderTests: XCTestCase {
     /// built from the resampler's own order puts it. It is the measurement that found #401, kept.
     func testStampedTagPlacesEveryChannelWhereTheResamplerPutIt() throws {
         for count in Int32(2)...8 {
-            let truth = Self.descriptionsLayout(labelsMatching: resamplerOrder(count))
+            let truth = Self.descriptionsLayout(labelsMatching: resamplerOrder(count), sevenOne: count == 8)
             let stamped = try XCTUnwrap(AVAudioChannelLayout(layoutTag: audioChannelLayoutTag(for: count)))
             for channel in 0..<Int(count) {
                 let expected = try Self.downmixToStereo(truth, signalAt: channel)
@@ -178,14 +186,22 @@ final class ChannelLayoutOrderTests: XCTestCase {
         }
     }
 
-    private static func descriptionsLayout(labelsMatching names: [String]) -> AVAudioChannelLayout {
-        let byName: [String: AudioChannelLabel] = [
+    private static func descriptionsLayout(labelsMatching names: [String],
+                                           sevenOne: Bool = false) -> AVAudioChannelLayout {
+        var byName: [String: AudioChannelLabel] = [
             "FL": kAudioChannelLabel_Left, "FR": kAudioChannelLabel_Right,
             "FC": kAudioChannelLabel_Center, "LFE": kAudioChannelLabel_LFEScreen,
             "BL": kAudioChannelLabel_LeftSurround, "BR": kAudioChannelLabel_RightSurround,
             "BC": kAudioChannelLabel_CenterSurround,
             "SL": kAudioChannelLabel_LeftSurroundDirect, "SR": kAudioChannelLabel_RightSurroundDirect,
         ]
+        // 7.1's sides are CoreAudio's Ls/Rs and its backs the rear pair (see `name(for:sevenOne:)`).
+        if sevenOne {
+            byName["SL"] = kAudioChannelLabel_LeftSurround
+            byName["SR"] = kAudioChannelLabel_RightSurround
+            byName["BL"] = kAudioChannelLabel_RearSurroundLeft
+            byName["BR"] = kAudioChannelLabel_RearSurroundRight
+        }
         let labels = names.map { byName[$0] ?? kAudioChannelLabel_Unknown }
         let size = MemoryLayout<AudioChannelLayout>.size
             + (labels.count - 1) * MemoryLayout<AudioChannelDescription>.size

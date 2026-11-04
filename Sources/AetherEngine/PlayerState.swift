@@ -1894,6 +1894,13 @@ import AetherLibavutil
 ///
 /// Every tag below was verified channel by channel against the resampler's order through a real
 /// downmix: all of them place all channels identically.
+///
+/// A stereo downmix cannot tell a side surround from a rear surround on the same side, though, so
+/// it passed 7.1 tagged MPEG_7_1_C (L R C LFE Ls Rs Rls Rrs), which names FFmpeg's back pair Ls/Rs
+/// and its side pair Rls/Rrs. CoreAudio plays Ls/Rs from the side speakers and Rls/Rrs from the
+/// rears, so 7.1 played its side and rear surrounds from each other's speakers: measured on an
+/// Apple TV 4K into a Samsung HW-Q990F with Dolby's TrueHD 7.1 Channel Check on the software path.
+/// WAVE_7_1 (L R C LFE Rls Rrs Ls Rs) is FFmpeg's 7.1 order exactly.
 func audioChannelLayoutTag(for channels: Int32) -> AudioChannelLayoutTag {
     switch channels {
     case 1:  return kAudioChannelLayoutTag_Mono            // FC, and a mono track is not a centre
@@ -1903,7 +1910,7 @@ func audioChannelLayoutTag(for channels: Int32) -> AudioChannelLayoutTag {
     case 5:  return kAudioChannelLayoutTag_MPEG_5_0_A      // FL FR FC BL BR
     case 6:  return kAudioChannelLayoutTag_MPEG_5_1_A      // FL FR FC LFE BL BR
     case 7:  return kAudioChannelLayoutTag_MPEG_6_1_A      // FL FR FC LFE BL BR BC
-    case 8:  return kAudioChannelLayoutTag_MPEG_7_1_C      // FL FR FC LFE BL BR Ls Rs
+    case 8:  return kAudioChannelLayoutTag_WAVE_7_1        // FL FR FC LFE BL(Rls) BR(Rrs) SL(Ls) SR(Rs)
     default: return kAudioChannelLayoutTag_DiscreteInOrder | UInt32(channels)
     }
 }
