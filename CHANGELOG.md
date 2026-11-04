@@ -20,6 +20,12 @@ the public-API contract.
   HW-Q990F with Dolby's TrueHD 7.1 Channel Check on the software path: the same channels re-encoded to FLAC in
   each order played right only with the back pair in Rls/Rrs. The FLAC bridge needs nothing: AVPlayer plays
   its 7.1 FLAC in FFmpeg's order from the right speakers (the same clip, progressive, through the bridge).
+- **Compressed E-AC-3 JOC on the software host played nothing on tvOS.** With `objectAudioRendering` on, the
+  host hands the JOC stream to its audio renderer compressed, and the Atmos output activator looped its silent
+  E-AC-3 beside it. Measured on an Apple TV 4K into a Samsung HW-Q990F with an E-AC-3 Atmos file on the
+  software path: the soundbar showed Dolby and stayed silent from the start, a pause and play did not bring
+  the sound, and the same file played with sound on the AVPlayer route. The activator now runs for the
+  rendered beds (APAC and PCM) only; the compressed JOC stream is a Dolby bitstream of its own.
 
 ## [7.56.0] - 2026-11-03
 

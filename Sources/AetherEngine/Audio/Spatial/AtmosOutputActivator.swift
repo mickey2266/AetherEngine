@@ -1,8 +1,9 @@
 import AVFoundation
 
 /// Keeps a tvOS HDMI route in Dolby Atmos while the engine plays a rendered object-audio bed (APAC or
-/// PCM, `SpatialBedFormat`), or compressed E-AC-3 JOC on the software host: through its `AVPlayer`,
-/// or through the software host's sample-buffer audio renderer (the Dolby Vision FEL route).
+/// PCM, `SpatialBedFormat`): through its `AVPlayer`, or through the software host's sample-buffer
+/// audio renderer (the Dolby Vision FEL route). Not beside the software host's compressed E-AC-3 JOC,
+/// which played nothing with it (`SoftwareAtmosRoute.takesAtmosOutputActivator`).
 ///
 /// tvOS hands APAC to the receiver as Dolby MAT, and some sinks show Dolby Atmos for that on their own.
 /// Not all do: a Samsung HW-Q990C fed by an Apple TV 4K (tvOS 27.2) played APAC without ever showing

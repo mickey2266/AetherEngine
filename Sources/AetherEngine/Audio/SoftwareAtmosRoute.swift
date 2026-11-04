@@ -84,11 +84,19 @@ enum SoftwareAtmosRoute: Equatable, Sendable {
         return nil
     }
 
-    /// Whether this route needs `AtmosOutputActivator` on tvOS: compressed E-AC-3 JOC and every rendered
-    /// bed, TrueHD Atmos or DTS:X. Without it some sinks never switch to Dolby MAT and play the bed as
-    /// stereo or 7.1 PCM, heights folded away.
+    /// Whether this route needs `AtmosOutputActivator` on tvOS: every rendered bed, TrueHD Atmos or
+    /// DTS:X. Without it some sinks never switch to Dolby MAT and play the bed as stereo or 7.1 PCM,
+    /// heights folded away.
+    ///
+    /// Not compressed E-AC-3 JOC: that is a Dolby bitstream of its own, and beside the activator's
+    /// silent E-AC-3 loop it played nothing. Measured on an Apple TV 4K into a Samsung HW-Q990F with
+    /// an E-AC-3 Atmos file on the software path: the soundbar showed Dolby and stayed silent from the
+    /// start, through a pause and play, while the same file had its sound on the AVPlayer route.
     var takesAtmosOutputActivator: Bool {
-        self != .pcm
+        switch self {
+        case .pcm, .compressedEAC3JOC: return false
+        case .apac, .pcmBed: return true
+        }
     }
 
     /// Packets of the source's head the JOC check may look at, and the bytes it may hold. The check

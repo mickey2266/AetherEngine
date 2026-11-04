@@ -109,11 +109,11 @@ struct SoftwareAtmosRouteTests {
         #expect(route(codec: AV_CODEC_ID_AAC) == .pcm)
     }
 
-    @Test("every rendered bed and JOC E-AC-3 take the Atmos activator, the PCM decode does not")
+    @Test("every rendered bed takes the Atmos activator, compressed JOC E-AC-3 and the PCM decode do not")
     func activatorRoutes() {
         #expect(SoftwareAtmosRoute.apac(.l714).takesAtmosOutputActivator)
         #expect(SoftwareAtmosRoute.pcmBed(.l916).takesAtmosOutputActivator)
-        #expect(SoftwareAtmosRoute.compressedEAC3JOC.takesAtmosOutputActivator)
+        #expect(!SoftwareAtmosRoute.compressedEAC3JOC.takesAtmosOutputActivator)
         #expect(!SoftwareAtmosRoute.pcm.takesAtmosOutputActivator)
     }
 
