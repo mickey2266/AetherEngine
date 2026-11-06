@@ -1034,6 +1034,9 @@ public final class AetherEngine: ObservableObject {
             softwareHost?.updateSubtitleCompositor(cues: subtitleCues + secondarySubtitleCues, enabled: pictureInPictureActive, delaySeconds: softwareSubtitleDelaySeconds)
             noteVideoPresentationToHost()
             #if os(tvOS)
+            // AIOStreams fork: the silent Atmos stream beside a rendered bed silenced the bed in the
+            // window, so it stops while the window shows (`suspendedForPictureInPicture`).
+            atmosOutputActivator?.suspendedForPictureInPicture = pictureInPictureActive
             // PiP window closed while backgrounded: nothing keeps the app running anymore, so the
             // wedge-safe teardown is due before idle suspension (mirrors the iOS pause-while-backgrounded path).
             if closingPictureInPictureOwesBackgroundDecision(wasActive: oldValue) {
