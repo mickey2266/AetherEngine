@@ -47,11 +47,12 @@ struct Issue174PersistentReadBackpressureTests {
         let diag = reader.windowDiagnostics
         #expect(diag.parked,
                 "the end must be recorded as backpressure so the refill path owns it")
-        #expect(diag.aheadBytes < 32 * 1024 * 1024,
-                "window held \(diag.aheadBytes / (1024 * 1024)) MB against a 16 MB high water")
+        // AIOStreams fork: the VOD high water is 64 MB (was 16 MB); the bounds keep their ratios.
+        #expect(diag.aheadBytes < 128 * 1024 * 1024,
+                "window held \(diag.aheadBytes / (1024 * 1024)) MB against a 64 MB high water")
         #expect(server.requestedRanges.filter { $0.start == 0 }.count == 1,
                 "the refill must not fire while nothing drains: \(server.requestedRanges)")
-        #expect(server.bytesWritten < 48 * 1024 * 1024,
+        #expect(server.bytesWritten < 192 * 1024 * 1024,
                 "origin served \(server.bytesWritten / (1024 * 1024)) MB into a stalled consumer")
     }
 
@@ -69,7 +70,8 @@ struct Issue174PersistentReadBackpressureTests {
         try await waitFor { reader.windowDiagnostics.parked }
 
         let sliceCap = 256 * 1024
-        let target = 48 * 1024 * 1024
+        // Past the 64 MB window and into the next range, so only a refill can deliver it.
+        let target = 160 * 1024 * 1024
         let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: sliceCap)
         defer { buf.deallocate() }
         var got = 0

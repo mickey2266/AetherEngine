@@ -1092,6 +1092,12 @@ public final class Demuxer: @unchecked Sendable {
         // the cold-start state that only exists to serve them. Deliberately after probeStreams:
         // find_stream_info is where the trailing-index ping-pong lives, not avformat_open_input.
         avioProvider?.markOpenPhaseFinished()
+        // AIOStreams fork: the playback reader replaces a connection that runs below the media's
+        // mean rate, which it learns here, from the duration this open resolved. Side readers
+        // (subtitles, stills, probes) read at their own pace and are left out.
+        if openProfile.readerLabel == DemuxerOpenProfile.playback.readerLabel {
+            (avioProvider as? AVIOReader)?.noteMediaDuration(duration)
+        }
         promoteAlternativeTransferHLG()
     }
 

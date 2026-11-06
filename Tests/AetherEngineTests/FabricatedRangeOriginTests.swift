@@ -7,7 +7,8 @@ import Foundation
 @Suite("Fabricated range origins", .offCooperativePool)
 struct FabricatedRangeOriginTests {
 
-    private static let size: Int64 = 128 * 1024 * 1024
+    /// AIOStreams fork: room past one 128 MB range for the reads below, which run to a range plus 8 MB.
+    private static let size: Int64 = 512 * 1024 * 1024
     private static let chunk = 1024 * 1024
 
     /// Reads forward in 1 MiB steps until `limit` or the first failed read, checking every byte
@@ -45,9 +46,12 @@ struct FabricatedRangeOriginTests {
         #expect(result.wrongAt == nil, "wrong byte at \(result.wrongAt ?? -1)")
         #expect(!result.failed, "the read failed at \(result.read)")
         #expect(result.read >= limit)
-        let refill = AVIOReader.persistentRangeBytes - Int64(AVIOReader.rangeCheckBytes)
-        #expect(server.requestLog.contains { $0.start == refill },
-                "no refill asked from \(refill): \(server.requestLog.map(\.start))")
+        // AIOStreams fork: the first connection now ends at the 64 MB high water or at the 128 MB
+        // range end, whichever the consumer's pace reaches first, so the checked refill is asked
+        // from wherever that left the frontier: any data request past the opening one and short of
+        // what was read, the tail prefetch excluded by position.
+        #expect(server.requestLog.contains { $0.start > 0 && $0.start < limit },
+                "no refill asked inside the read: \(server.requestLog.map(\.start))")
         #expect(!FabricatedRangeOrigins.caughtRecently(url, within: 60))
     }
 
