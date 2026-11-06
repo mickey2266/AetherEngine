@@ -53,6 +53,22 @@ final class AtmosOutputActivator {
     private let pauseGrace: Duration
     private var pauseAfterGrace: Task<Void, Never>?
 
+    /// AIOStreams fork: true while a picture-in-picture window shows the engine's video. With the
+    /// stream playing beside it, a rendered bed (TrueHD Atmos and DTS:X alike, 7.1.4 and 9.1.6) played
+    /// nothing in the window over the tvOS Home screen, with or without a display mode switch, while
+    /// E-AC-3 Atmos passed through, which never runs the stream, kept its sound there. The stream is
+    /// released for as long as the window shows and comes back with the next update after it.
+    var suspendedForPictureInPicture = false {
+        didSet {
+            guard suspendedForPictureInPicture != oldValue else { return }
+            EngineLog.emit(
+                "[AtmosOutputActivator] \(suspendedForPictureInPicture ? "off" : "back") for the picture-in-picture window",
+                category: .session
+            )
+            update()
+        }
+    }
+
     nonisolated static let defaultPauseGrace: Duration = .seconds(60)
 
     init(
@@ -173,7 +189,7 @@ final class AtmosOutputActivator {
                 category: .session
             )
         }
-        guard routeTakesIt else {
+        guard routeTakesIt, !suspendedForPictureInPicture else {
             release()
             return
         }
@@ -232,6 +248,8 @@ extension AetherEngine {
         if let player = currentAVPlayer {
             let activator = atmosOutputActivator ?? AtmosOutputActivator()
             atmosOutputActivator = activator
+            // A reload while the window shows builds or re-attaches it: it stays off.
+            activator.suspendedForPictureInPicture = pictureInPictureActive
             activator.attach(to: player) { [weak self] _ in
                 guard let session = self?.nativeVideoSession else { return false }
                 return session.audioIsRenderedBed
