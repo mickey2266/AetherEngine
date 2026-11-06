@@ -660,16 +660,30 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     // source that sustainedly outruns realtime (a misdeclared VOD). 64 MB matches
     // streamHighWater, the forward bound the engine already accepts for the other reader
     // that cannot bound by range request.
-    private static let winHighWaterDefault = 16 * 1024 * 1024
+    //
+    // AIOStreams fork: VOD was 16 MB high / 8 MB low, under 2 s of an 80 Mbit/s remux between
+    // the socket and the demuxer, and on the pushed path one request per 8 MB of drain once
+    // the producer is paced (every ~0.8 s at that rate). 64 MB / 32 MB is the live figure the
+    // engine already accepts for its memory, and at remux rates it is ~6 s of read-ahead and a
+    // drain cycle every few seconds. A pushed connection is still ENDED at the high water, never
+    // parked, so the #310 invariant is unchanged; a held one pulls into whatever room the
+    // window has, so the larger window is deeper read-ahead and changes nothing about its
+    // dormancy (that is `heldPullSlack` over media rate). Live keeps its 8 MB low water, and a
+    // reader given its own high water (tests, side readers) keeps 8 MB too.
+    private static let winHighWaterDefault = 64 * 1024 * 1024
     private static let liveWinHighWaterDefault = 64 * 1024 * 1024
-    private static let winLowWater = 8 * 1024 * 1024
+    private static let winLowWaterFloor = 8 * 1024 * 1024
+    private static let vodWinLowWaterDefault = 32 * 1024 * 1024
     // #220: how much the persistent reader asks for at a time. Bounds a single request's
     // exposure: `appendPersistentData` drops anything past the requested end and ends the
     // transfer (audit DMX-1), so an origin that ignores Range or answers wider than asked
     // cannot grow the window past it. It also keeps the request cadence modest on a healthy link:
     // one request per range boundary while the consumer keeps up, one per
     // highWater-to-lowWater drain cycle when the origin outruns it.
-    static let persistentRangeBytes: Int64 = 32 * 1024 * 1024
+    // AIOStreams fork: 128 MB (was 32 MB), so a pushed reader keeping up with a remux asks
+    // every ~13 s at 80 Mbit/s rather than every ~3 s. It stays above the VOD high water, so a
+    // stalled consumer is still ended by the high water (bounded window) before the range ends.
+    static let persistentRangeBytes: Int64 = 128 * 1024 * 1024
 
     /// #377: the smallest window room worth a read on a held connection, and therefore the length
     /// of a dormant stretch in the steady state (this over media rate). #310's dose is that
@@ -743,6 +757,33 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// 20 s: the one outcome the stall witness could never describe was the one where the first
     /// byte never comes, because the load was already over when it fired.
     private static let firstByteWitnessMaxSeconds: TimeInterval = 5
+    // MARK: Slow-connection replacement (AIOStreams fork)
+    //
+    // The stall and trickle checks above end a connection that carries nothing, or under
+    // `trickleFloorBytes` (~0.8 Mbit/s). A connection a CDN slows to 10 Mbit/s on a 60 Mbit/s
+    // remux passes both, and the forward buffer drains into a stall while it does. Debrid CDNs
+    // commonly pace one connection and serve a new one at full speed, so a VOD connection the
+    // consumer has been WAITING on for `slowConnectionPeriod`, delivering below the media's own
+    // mean rate (`fileSize` over the duration, which the demuxer reports once it has opened), is
+    // replaced at the frontier. Nothing is dropped: the window keeps every delivered byte.
+    //
+    // Judged only while the consumer is at the frontier, which is the producer filling its forward
+    // buffer: a read-ahead above `slowResetAheadBytes` means the link is keeping up (or the
+    // producer is parked), and restarts the measurement. An origin that is simply slower than the
+    // media gets `slowReplacementMaxStreak` replacements in a row, then none for
+    // `slowCheckBackoffSeconds`, so it costs a few requests rather than one every period.
+
+    /// How long the consumer has to wait on a connection below the media's rate before it is replaced.
+    static let slowConnectionPeriodDefault: TimeInterval = 8
+    /// The rate a connection has to keep up, as a fraction of the media's mean byte rate.
+    static let slowConnectionRateFraction = 1.0
+    /// Read-ahead past which the consumer is not waiting on the connection.
+    private static let slowResetAheadBytes = 4 * 1024 * 1024
+    /// Consecutive slow replacements before the check rests.
+    private static let slowReplacementMaxStreak = 3
+    /// How long the check rests after that.
+    private static let slowCheckBackoffSeconds: TimeInterval = 120
+
     // A reconnect that delivers at least this much counts as progress; resets streak.
     private static let minReconnectProgress: Int64 = 512 * 1024
     // Cap on CONSECUTIVE unproductive reconnects; resets on real progress.
@@ -1036,6 +1077,27 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private var trickleEnds = 0
     private var deliveryGapEnds = 0
 
+    /// AIOStreams fork, slow-connection replacement. All winCond-guarded. The media's mean byte
+    /// rate (0 while unknown, and always for live); where the current measurement started, with the
+    /// generation's delivered bytes then and the generation it belongs to; the run of consecutive
+    /// replacements; and until when the check rests.
+    private var mediaBytesPerSecond: Double = 0
+    private var slowSince: DispatchTime?
+    private var slowSinceBytes: Int64 = 0
+    private var slowSinceGeneration = -1
+    private var slowReplacementStreak = 0
+    private var slowCheckRestsUntil: DispatchTime?
+    private var slowEnds = 0
+    /// `slowConnectionPeriodDefault` unless a test shortens it.
+    private let slowConnectionPeriod: TimeInterval
+
+    /// How many connections this reader replaced for running below the media's rate.
+    var slowEndCountForTesting: Int {
+        winCond.lock()
+        defer { winCond.unlock() }
+        return slowEnds
+    }
+
     /// #309: earliest time the read loop may replace a FAULTED connection from the serve path.
     /// The failure ladder there cannot sleep (see `chargeFaultedRunwayRefill`), so its backoff is
     /// a timestamp instead. `.distantPast` = attempt now, `.distantFuture` = the bounded give-up
@@ -1317,6 +1379,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// hook would leak into whatever suite runs concurrently. The shipped values are the
     /// two statics above.
     private let winHighWater: Int
+    /// Read-ahead at or below which the read loop asks for the next range at the frontier.
+    /// `vodWinLowWaterDefault` for a VOD reader on the shipped high water, `winLowWaterFloor`
+    /// for live and for a reader given a high water of its own.
+    private let winLowWater: Int
     /// `LoadOptions.heldSourceConnection` (#377): this reader asks the origin once and pulls,
     /// instead of ending at the high water and asking again at low water. Opt in, an init
     /// parameter rather than a process-wide hook for the same reason `winHighWater` is one, and
@@ -1341,7 +1407,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// AE#927: grows a controlled probe's sequential ranges. Demux thread only, like `position`.
     private var probeRangeGrowth: ProbeRangeGrowth?
 
-    init(url: URL, extraHeaders: [String: String] = [:], label: String = "source", chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false, chunkRequestTimeout: TimeInterval = 35, chunkMaxRetries: Int = 3, boundedInitialFetch: Int64? = nil, sequentialOnly: Bool = false, connStallTimeout: TimeInterval = AVIOReader.connStallTimeoutDefault, trickleFloorBytes: Int64? = nil, windowHighWater: Int? = nil, streamHighWater: Int? = nil, detourIdleSeconds: TimeInterval? = nil, detourFetchBudget: TimeInterval? = nil, heldConnection: Bool = false, probeControl: ProbeControl? = nil, probeRequestSession: URLSession? = nil, probeRangeCeiling: Int? = nil, sourceOpenPolicy: SourceOpenPolicy = .init(), requestHeaderStore: RequestHeaderStore? = nil, backoffScale: Double = 1, pinIdleSeconds: TimeInterval = AVIOReader.pinIdleRepinSecondsDefault, liveRefusalRetryBudget: TimeInterval = AVIOReader.liveRefusalRetryBudget, persistentRequestSession: URLSession? = nil, diagnosticContext: SourceNetworkDiagnostics.Context? = SourceNetworkDiagnostics.context, routesDiscMediaType: Bool = false) {
+    init(url: URL, extraHeaders: [String: String] = [:], label: String = "source", chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false, chunkRequestTimeout: TimeInterval = 35, chunkMaxRetries: Int = 3, boundedInitialFetch: Int64? = nil, sequentialOnly: Bool = false, connStallTimeout: TimeInterval = AVIOReader.connStallTimeoutDefault, trickleFloorBytes: Int64? = nil, slowConnectionPeriod: TimeInterval = AVIOReader.slowConnectionPeriodDefault, windowHighWater: Int? = nil, streamHighWater: Int? = nil, detourIdleSeconds: TimeInterval? = nil, detourFetchBudget: TimeInterval? = nil, heldConnection: Bool = false, probeControl: ProbeControl? = nil, probeRequestSession: URLSession? = nil, probeRangeCeiling: Int? = nil, sourceOpenPolicy: SourceOpenPolicy = .init(), requestHeaderStore: RequestHeaderStore? = nil, backoffScale: Double = 1, pinIdleSeconds: TimeInterval = AVIOReader.pinIdleRepinSecondsDefault, liveRefusalRetryBudget: TimeInterval = AVIOReader.liveRefusalRetryBudget, persistentRequestSession: URLSession? = nil, diagnosticContext: SourceNetworkDiagnostics.Context? = SourceNetworkDiagnostics.context, routesDiscMediaType: Bool = false) {
         self.diagnosticContext = diagnosticContext
         self.routesDiscMediaType = routesDiscMediaType
         self.sourceOpenPolicy = sourceOpenPolicy
@@ -1371,6 +1437,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             Double(Self.trickleFloorBytesDefault) * self.connStallTimeout / Self.connStallTimeoutDefault))
         self.winHighWater = max(1, windowHighWater
             ?? (isLive ? Self.liveWinHighWaterDefault : Self.winHighWaterDefault))
+        self.winLowWater = windowHighWater == nil && !isLive
+            ? Self.vodWinLowWaterDefault : Self.winLowWaterFloor
+        self.slowConnectionPeriod = max(0.05, slowConnectionPeriod)
         self.streamHighWater = max(1, streamHighWater ?? Self.streamHighWaterDefault)
         self.detourBlockIdleSeconds = detourIdleSeconds ?? Self.detourBlockIdleSecondsDefault
         self.detourFetchBudget = detourFetchBudget ?? Self.detourFetchBudgetSeconds
@@ -2846,7 +2915,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 var refillRetryAfter: TimeInterval = 0
                 let undrained = window.count - max(0, Int(position - winStart))
                 let frontier = winStart + Int64(window.count)
-                if activeTransfer == nil, undrained <= Self.winLowWater,
+                // AIOStreams fork: the consumer is no longer waiting on the connection, so a slow
+                // stretch measured from here would count a parked producer's quiet as the link's.
+                if undrained > Self.slowResetAheadBytes { slowSince = nil }
+                if activeTransfer == nil, undrained <= winLowWater,
                    isLive || fileSize <= 0 || frontier < fileSize {
                     if connEndedAtRangeEnd || connEndedByBackpressure {
                         refillFrom = frontier
@@ -2903,6 +2975,25 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             }
 
             if !ended {
+                // AIOStreams fork: a connection the consumer has waited on for a period below the
+                // media's rate is replaced at the frontier, keeping the window. Not charged to the
+                // unproductive streak: it delivered, and a dead source is not what this detects.
+                if let slow = slowConnectionVerdictLocked() {
+                    let generation = connGeneration
+                    winCond.unlock()
+                    let mbps = { (bytesPerSecond: Double) in String(format: "%.1f", bytesPerSecond * 8 / 1_000_000) }
+                    EngineLog.emit(
+                        "[AVIOReader] \(label) gen=\(generation) slow: \(mbps(slow.bytesPerSecond)) Mbit/s over "
+                        + "\(String(format: "%.1f", slow.span))s while a read waited, under the media's "
+                        + "\(mbps(slow.floorBytesPerSecond)) Mbit/s; replacing it at offset \(frontier)"
+                        + (slow.restsAfter
+                            ? " (\(Self.slowReplacementMaxStreak) in a row; the check rests "
+                              + "\(Int(Self.slowCheckBackoffSeconds))s)"
+                            : ""),
+                        category: .demux)
+                    timedReconnect(seek: false, at: frontier)
+                    continue
+                }
                 // Wait for the live connection to fill forward. A false return
                 // means connStallTimeout elapsed with no data (socket stall).
                 let waitStart = DispatchTime.now()
@@ -3579,6 +3670,70 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// The bound itself, free of the reader's state so it can be checked without a socket.
     nonisolated static func tailPrefetchWaitBudget(firstDataMs: Double) -> TimeInterval {
         min(5.0, max(0.25, (firstDataMs / 1000) * 2))
+    }
+
+    /// AIOStreams fork: the media's duration, from the demuxer once it has opened, which with the
+    /// source's size gives the mean rate a connection has to keep up (slow-connection replacement,
+    /// see `slowConnectionPeriodDefault`). Live, an unknown size or a nonpositive duration leaves the
+    /// check off.
+    func noteMediaDuration(_ seconds: Double) {
+        winCond.lock()
+        defer { winCond.unlock() }
+        guard !isLive, seconds.isFinite, seconds > 0, fileSize > 0 else {
+            mediaBytesPerSecond = 0
+            return
+        }
+        mediaBytesPerSecond = Double(fileSize) / seconds
+    }
+
+    /// AIOStreams fork: what the read loop logs when it replaces a slow connection.
+    private struct SlowConnectionVerdict {
+        let bytesPerSecond: Double
+        let floorBytesPerSecond: Double
+        let span: Double
+        let restsAfter: Bool
+    }
+
+    /// AIOStreams fork: judges the current connection while the consumer waits at the frontier.
+    /// The first call of a stretch starts the measurement; each call a period or more after that
+    /// judges the stretch and starts the next. Caller holds `winCond`.
+    private func slowConnectionVerdictLocked() -> SlowConnectionVerdict? {
+        guard !isLive, mediaBytesPerSecond > 0, connFirstDataSeen, !connEnded, activeTransfer != nil else {
+            slowSince = nil
+            return nil
+        }
+        let now = DispatchTime.now()
+        if let rest = slowCheckRestsUntil {
+            guard now.uptimeNanoseconds >= rest.uptimeNanoseconds else { return nil }
+            slowCheckRestsUntil = nil
+            slowReplacementStreak = 0
+            slowSince = nil
+        }
+        guard let since = slowSince, slowSinceGeneration == connGeneration else {
+            slowSince = now
+            slowSinceBytes = genDeliveredBytes
+            slowSinceGeneration = connGeneration
+            return nil
+        }
+        let span = Double(now.uptimeNanoseconds - since.uptimeNanoseconds) / 1_000_000_000
+        guard span >= slowConnectionPeriod else { return nil }
+        let rate = Double(genDeliveredBytes - slowSinceBytes) / span
+        let floor = mediaBytesPerSecond * Self.slowConnectionRateFraction
+        slowSince = now
+        slowSinceBytes = genDeliveredBytes
+        guard rate < floor else {
+            slowReplacementStreak = 0
+            return nil
+        }
+        slowReplacementStreak += 1
+        slowEnds += 1
+        let rests = slowReplacementStreak >= Self.slowReplacementMaxStreak
+        if rests {
+            slowCheckRestsUntil = now + Self.slowCheckBackoffSeconds
+        }
+        slowSince = nil
+        return SlowConnectionVerdict(bytesPerSecond: rate, floorBytesPerSecond: floor, span: span,
+                                     restsAfter: rests)
     }
 
     /// Which non-206 answers to `bytes=-n` are the origin's verdict on the suffix-range FORM, and so

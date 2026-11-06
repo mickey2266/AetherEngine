@@ -494,6 +494,7 @@ enum SessionOptionCorrection {
         "clampsLiveResumeToWindow", "nativeRemoteHLS", "nativeRemoteHLSIngestFallback",
         "preserveASSMarkup", "prepareNativeSubtitles", "eagerNativeSubtitleReaders", "serveIFramePlaylist", "generatesBackgroundScrubPreviews", "confirmAtmos",
         "nativeSubtitlePreferredLanguages", "sequentialOrigin", "maxConcurrentSourceRequests", "heldSourceConnection",
+        "confirmsAtmosOnHeldSourceConnection",
         "declaredDurationSeconds", "probesize", "maxAnalyzeDuration", "skipsContainerAttachments", "preferredAudioLanguages",
         "preferredSubtitleLanguages", "externalSubtitles", "initialSubtitleTrackID", "forwardBufferSegments", "sessionCacheByteBudget", "softwarePacketCacheStorage", "progressiveSegmentDelivery", "autoplay",
         "audioDelaySeconds", "audioShaping", "teletextPage", "deinterlaceMode", "deinterlaceFieldRate", "preferredDecodePath",

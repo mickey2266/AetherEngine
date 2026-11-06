@@ -923,6 +923,15 @@ public struct LoadOptions: Sendable, Equatable {
     /// so a reload cannot change it. Default false, which is every reader shipped so far.
     public var heldSourceConnection: Bool = false
 
+    /// AIOStreams fork: the host holds the connection for throughput rather than because the origin
+    /// refuses a second request, so `confirmAtmos` still runs its pass on a handle of its own.
+    /// Without it, `heldSourceConnection` declines the pass as it does for `sequentialOrigin` and an
+    /// origin limited to one request, and the tracks keep the pre-decode guess. Those two still
+    /// decline it with this set: they say the origin itself can't take a second request. Only the
+    /// Atmos pass reads this; the I-frame rendition and the background still ladder keep declining
+    /// on a held connection. Default false.
+    public var confirmsAtmosOnHeldSourceConnection: Bool = false
+
     /// Trusted media duration in seconds, overriding the container/estimate-derived value (same
     /// trust family as the disc MPLS/IFO override, AE#105). Required alongside
     /// `sequentialOrigin` for VOD sources: with the tail read gone the demuxer resolves no

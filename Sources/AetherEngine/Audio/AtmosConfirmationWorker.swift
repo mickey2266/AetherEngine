@@ -55,7 +55,10 @@ extension AetherEngine {
         if let reason = Self.atmosConfirmationDeclineReason(
             originSerial: !isCustomSource && OriginRequestBudget.shared.requiresSerialRequests(url),
             sequentialOrigin: loadedOptions.sequentialOrigin,
+            // AIOStreams fork: a host that holds the connection for throughput says so, and the
+            // pass runs on its own handle (`confirmsAtmosOnHeldSourceConnection`).
             heldSourceConnection: loadedOptions.heldSourceConnection
+                && !loadedOptions.confirmsAtmosOnHeldSourceConnection
         ) {
             EngineLog.emit(
                 "[AtmosConfirmation] skipped: \(reason); isAtmos stays the pre-decode guess",
