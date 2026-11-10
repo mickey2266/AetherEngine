@@ -166,6 +166,8 @@ final class SoftwarePlaybackHost {
     var ioWindowDiagnostics: (windowBytes: Int, aheadBytes: Int, parked: Bool)? {
         demuxer?.ioWindowDiagnostics
     }
+    /// AIOStreams fork: the pump demuxer, for `AetherEngine.prefetchLandings`.
+    var pumpDemuxer: Demuxer? { demuxer }
 
     /// #240: lifetime bytes this pump pulled from the source, so the memprobe can put it next to the
     /// subtitle side reader's own total and say which one took the link.
