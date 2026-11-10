@@ -2543,6 +2543,54 @@ public final class Demuxer: @unchecked Sendable {
         return compositionRepair?.keyframeAdvanceTicks ?? 0
     }
 
+    /// AIOStreams fork: the times last handed to `setLandings`, so a retry can tell it was replaced.
+    /// Main-actor use only (`AetherEngine.prefetchLandings`).
+    nonisolated(unsafe) var requestedLandingSeconds: [Double] = []
+
+    /// AIOStreams fork: tells the source reader where the page may skip to, so it can hold the bytes
+    /// there ahead of the skip (`AVIOReader.setLandings`). `seconds` are on the source axis, as
+    /// `seek(to:)` takes them. Each becomes the byte position of the last indexed video keyframe at
+    /// or before it, which is where a seek to that time starts reading. False while the container's
+    /// index doesn't cover them yet (Matroska loads its Cues on the first seek), when the caller
+    /// should ask again later; true once every time resolved or when there is no network reader.
+    @discardableResult
+    func setLandings(seconds: [Double]) -> Bool {
+        requestedLandingSeconds = seconds
+        guard let reader = avioProvider as? AVIOReader else { return true }
+        if seconds.isEmpty {
+            reader.setLandings([])
+            return true
+        }
+        let streamIndex = videoStreamIndex
+        guard streamIndex >= 0 else { return false }
+        let entries = indexedKeyframeEntries(streamIndex: streamIndex)
+        guard !entries.isEmpty else { return false }
+        accessLock.lock()
+        guard let ctx = formatContext, streamIndex < Int32(ctx.pointee.nb_streams),
+              let stream = ctx.pointee.streams[Int(streamIndex)] else {
+            accessLock.unlock()
+            return false
+        }
+        let timeBase = stream.pointee.time_base
+        accessLock.unlock()
+        guard timeBase.num > 0, timeBase.den > 0 else { return false }
+        let tick = Double(timeBase.num) / Double(timeBase.den)
+        // An index that only covers part of the file would name a keyframe far before the time.
+        let tolerance = 30.0
+        var offsets: [Int64] = []
+        for target in seconds {
+            var bestPts = Int64.min
+            var bestPos: Int64 = -1
+            for entry in entries where Double(entry.pts) * tick <= target && entry.pts > bestPts {
+                bestPts = entry.pts
+                bestPos = entry.pos
+            }
+            if bestPos > 0, target - Double(bestPts) * tick <= tolerance { offsets.append(bestPos) }
+        }
+        reader.setLandings(offsets)
+        return offsets.count == seconds.count
+    }
+
     func readPacket(isCurrent: @Sendable () -> Bool = { true }) throws -> UnsafeMutablePointer<AVPacket>? {
         accessLock.lock()
         defer { accessLock.unlock() }

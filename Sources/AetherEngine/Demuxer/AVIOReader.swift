@@ -1088,6 +1088,72 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private var slowReplacementStreak = 0
     private var slowCheckRestsUntil: DispatchTime?
     private var slowEnds = 0
+
+    /// AIOStreams fork, adaptive forward-seek reach. A forward seek that lands past the frontier
+    /// waits on the live connection when the gap is what the link delivers in less than a new
+    /// request takes to be answered, and reconnects otherwise. The link's rate is measured over
+    /// bursts of delivery (a parked or stalled connection ends a burst, so its quiet is not read
+    /// as a slow link); the request cost is `lastFirstDataMs`. All winCond-guarded.
+    private var linkBytesPerSecond: Double = 0
+    private var rateBurstStart: DispatchTime?
+    private var rateBurstLast: DispatchTime?
+    private var rateBurstBytes: Int64 = 0
+    /// A gap between two deliveries longer than this ends a burst.
+    private static let rateBurstGapNs: UInt64 = 400_000_000
+    /// A burst shorter than this is too small to give a rate.
+    private static let rateBurstMinNs: UInt64 = 500_000_000
+    /// The reach never drops under the fixed limit this replaced, and never exceeds this.
+    private static let seekKeepForwardCeiling = 32 * 1024 * 1024
+
+    /// AIOStreams fork, landing prefetch. The bytes a skip lands on (the end of an intro, a recap)
+    /// are fetched ahead while the link can spare them, so the skip is served from memory and the
+    /// connection is started behind them rather than after the seek's first-byte wait. They are
+    /// held apart from `detourCache`, whose idle sweep would drop them long before anyone skips.
+    /// All guarded by `landingLock`, a leaf lock: nothing else is taken while it is held.
+    private let landingLock = NSLock()
+    private var landingTargets: [Int64] = []
+    private var landingBlocks: [Int64: Data] = [:]
+    private var landingAnchoredEnd: Int64 = -1
+    private var landingPassScheduled = false
+    private static let landingBlockSize = 4 * 1024 * 1024
+    private static let landingBlocksPerLanding = 2
+    private static let landingMaxTargets = 4
+    private static let landingPassInterval: TimeInterval = 5
+    /// What the window must hold beyond twice the link's time for the landing, in seconds of media.
+    private static let landingMarginSeconds: Double = 4
+    /// Landing blocks this far behind the reader are released.
+    private static let landingKeepBehind: Int64 = 16 * 1024 * 1024
+    private static let landingQueue = DispatchQueue(label: "aether.avio.landing", qos: .utility)
+
+    /// Folds one delivery into the burst the link's rate is read from. Caller holds `winCond`.
+    private func noteDeliveryForRateLocked(bytes: Int, at now: DispatchTime) {
+        if let last = rateBurstLast, let start = rateBurstStart,
+           now.uptimeNanoseconds &- last.uptimeNanoseconds <= Self.rateBurstGapNs {
+            rateBurstBytes += Int64(bytes)
+            rateBurstLast = now
+            let span = now.uptimeNanoseconds &- start.uptimeNanoseconds
+            if span >= Self.rateBurstMinNs {
+                let sample = Double(rateBurstBytes) / (Double(span) / 1_000_000_000)
+                linkBytesPerSecond = linkBytesPerSecond == 0 ? sample : linkBytesPerSecond * 0.7 + sample * 0.3
+                // Restart so the next sample covers fresh delivery, not the whole burst again.
+                rateBurstStart = now
+                rateBurstBytes = 0
+            }
+        } else {
+            rateBurstStart = now
+            rateBurstLast = now
+            rateBurstBytes = 0
+        }
+    }
+
+    /// How far past the frontier a forward seek is read through rather than reconnected for.
+    /// Caller holds `winCond`.
+    private func forwardSeekReachLocked() -> Int64 {
+        let floor = Int64(Self.seekKeepForwardLimit)
+        guard !isLive, linkBytesPerSecond > 0, lastFirstDataMs > 0 else { return floor }
+        let reach = Int64(linkBytesPerSecond * lastFirstDataMs / 1_000)
+        return min(max(reach, floor), Int64(Self.seekKeepForwardCeiling))
+    }
     /// `slowConnectionPeriodDefault` unless a test shortens it.
     private let slowConnectionPeriod: TimeInterval
 
@@ -2300,6 +2366,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         bufferLock.unlock()
 
         detourCache.clear()
+        landingLock.lock()
+        landingTargets.removeAll()
+        landingBlocks.removeAll()
+        landingAnchoredEnd = -1
+        landingLock.unlock()
 
         streamLock.lock()
         streamEnded = true
@@ -2588,6 +2659,32 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             if seek { seekReconnect(at: offset) } else { startPersistentConnection(at: offset) }
             diag.recordConnect(ms: msSince(connectStart))
         }
+        // AIOStreams fork: bytes held for a skip (`landingPass`) serve from memory. The first serve
+        // of a run starts the connection at the run's end, so the stream is arriving by the time
+        // the held bytes are read out instead of being asked for after they run dry. Called with
+        // `winCond` unlocked. True when it served.
+        func serveLanding(at curPosition: Int64) -> Bool {
+            guard let hit = serveFromLanding(into: buf.advanced(by: totalRead),
+                                             maxLen: requestSize - totalRead, at: curPosition) else { return false }
+            diag.recordDetourServe(ms: 0, fetched: false)
+            winCond.lock()
+            position = curPosition + Int64(hit.count)
+            let size = fileSize
+            winCond.broadcast()
+            winCond.unlock()
+            totalRead += hit.count
+            landingLock.lock()
+            let anchor = landingAnchoredEnd != hit.runEnd && hit.runEnd < size
+            if anchor { landingAnchoredEnd = hit.runEnd }
+            landingLock.unlock()
+            if anchor {
+                EngineLog.emit(
+                    "[AVIOReader] \(label) skip landing served from memory; connecting at \(hit.runEnd)",
+                    category: .demux)
+                timedReconnect(seek: true, at: hit.runEnd)
+            }
+            return true
+        }
         winCond.lock()
         let diagEntryPosition = position
         let diagGenAtStart = connGeneration
@@ -2775,6 +2872,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
             if curPosition < winStart {
                 winCond.unlock()
+                if serveLanding(at: curPosition) { continue }
                 // AE#782: a producer restart landed here, so this is where playback continues, not a
                 // parse read that returns. Bytes already resident still serve first; the first miss
                 // anchors the connection here. Detouring cost a jump back three serial 4 MB fetches
@@ -2948,8 +3046,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             let status = connStatus
             let retryAfter = connRetryAfter
 
-            if curPosition > frontier + Int64(Self.seekKeepForwardLimit) {
+            if curPosition > frontier + forwardSeekReachLocked() {
                 winCond.unlock()
+                if serveLanding(at: curPosition) { continue }
                 // Far-forward seek. Serve from the detour cache ONLY if the block is already
                 // resident (e.g. the moov region the parser revisits); a genuine forward scrub
                 // misses and re-anchors the streaming window there, never chunk-serving forever.
@@ -3438,6 +3537,137 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         } catch {
             return .failed
         }
+    }
+
+    // MARK: - Landing prefetch (AIOStreams fork)
+
+    /// Byte offsets the page may skip to, in the file's own order; replaces the previous set. Any
+    /// thread. Each is fetched in the background once the link can spare it (`landingPass`).
+    func setLandings(_ offsets: [Int64]) {
+        let targets = Array(offsets.filter { $0 > 0 }.sorted().prefix(Self.landingMaxTargets))
+        landingLock.lock()
+        landingTargets = targets
+        let keep = Set(targets.flatMap { landingBlockIndices(for: $0) })
+        landingBlocks = landingBlocks.filter { keep.contains($0.key) }
+        if landingBlocks.isEmpty { landingAnchoredEnd = -1 }
+        let schedule = !targets.isEmpty && !landingPassScheduled
+        if schedule { landingPassScheduled = true }
+        landingLock.unlock()
+        if schedule { scheduleLandingPass(after: 1) }
+    }
+
+    private func landingBlockIndices(for offset: Int64) -> [Int64] {
+        let first = offset / Int64(Self.landingBlockSize)
+        return (0..<Int64(Self.landingBlocksPerLanding)).map { first + $0 }
+    }
+
+    private func scheduleLandingPass(after delay: TimeInterval) {
+        Self.landingQueue.asyncAfter(deadline: .now() + delay) { [weak self] in self?.landingPass() }
+    }
+
+    /// One look at whether the nearest landing ahead can be fetched now. It can when the window
+    /// holds more than twice the link's time for the bytes plus a margin, so the fetch cannot
+    /// starve playback; the official app's player applies the same rule. Reschedules itself while
+    /// there are landings.
+    private func landingPass() {
+        landingLock.lock()
+        landingPassScheduled = false
+        let targets = landingTargets
+        landingLock.unlock()
+        guard !isFullyClosed, !targets.isEmpty else { return }
+
+        // Outside `winCond`, as the read path takes it: it asks the origin budget for the URL.
+        let eligible = detourEligible
+        winCond.lock()
+        let size = fileSize
+        let pos = position
+        let frontier = winStart + Int64(window.count)
+        let ahead = window.count - max(0, Int(position - winStart))
+        let rate = linkBytesPerSecond
+        let media = mediaBytesPerSecond
+        let reach = forwardSeekReachLocked()
+        winCond.unlock()
+
+        dropLandingBlocks(before: pos - Self.landingKeepBehind)
+
+        if eligible, size > 0, rate > 0, media > 0 {
+            landingLock.lock()
+            let next = targets.first { target in
+                // A landing the window will reach, or read through, needs nothing held for it.
+                target > frontier + reach
+                    && landingBlockIndices(for: target).contains {
+                        landingBlocks[$0] == nil && $0 * Int64(Self.landingBlockSize) < size
+                    }
+            }
+            landingLock.unlock()
+            if let next {
+                let bytes = Double(Self.landingBlocksPerLanding * Self.landingBlockSize)
+                if Double(ahead) / media >= 2 * bytes / rate + Self.landingMarginSeconds {
+                    fetchLanding(next, size: size)
+                }
+            }
+        }
+
+        landingLock.lock()
+        let again = !landingTargets.isEmpty && !landingPassScheduled
+        if again { landingPassScheduled = true }
+        landingLock.unlock()
+        if again, !isFullyClosed { scheduleLandingPass(after: Self.landingPassInterval) }
+    }
+
+    private func fetchLanding(_ target: Int64, size: Int64) {
+        for idx in landingBlockIndices(for: target) {
+            if isClosed { return }
+            landingLock.lock()
+            let held = landingBlocks[idx] != nil
+            landingLock.unlock()
+            if held { continue }
+            let start = idx * Int64(Self.landingBlockSize)
+            guard start < size else { return }
+            let length = Int(min(Int64(Self.landingBlockSize), size - start))
+            // A short body is not kept: serving it would hand the reader a hole.
+            guard case .ok(let data) = detourFetchBlock(from: start, size: length),
+                  data.count == length, !isClosed else { return }
+            landingLock.lock()
+            if !isFullyClosed { landingBlocks[idx] = data }
+            landingLock.unlock()
+            EngineLog.emit(
+                "[AVIOReader] \(label) holding \(length / 1024)KB at offset \(start) for a skip",
+                category: .demux)
+        }
+    }
+
+    private func dropLandingBlocks(before offset: Int64) {
+        let blockSize = Int64(Self.landingBlockSize)
+        landingLock.lock()
+        landingBlocks = landingBlocks.filter { ($0.key + 1) * blockSize > offset }
+        if landingBlocks.isEmpty { landingAnchoredEnd = -1 }
+        landingLock.unlock()
+    }
+
+    /// Copies from a held landing block, to the block's end at most, and says where the held run
+    /// that contains `offset` ends. nil when `offset` is in no held block.
+    private func serveFromLanding(into dst: UnsafeMutablePointer<UInt8>, maxLen: Int,
+                                  at offset: Int64) -> (count: Int, runEnd: Int64)? {
+        guard maxLen > 0, offset >= 0 else { return nil }
+        let blockSize = Int64(Self.landingBlockSize)
+        landingLock.lock()
+        defer { landingLock.unlock() }
+        guard !landingBlocks.isEmpty else { return nil }
+        let idx = offset / blockSize
+        guard let block = landingBlocks[idx] else { return nil }
+        let inBlock = Int(offset - idx * blockSize)
+        guard inBlock < block.count else { return nil }
+        let n = min(maxLen, block.count - inBlock)
+        block.withUnsafeBytes { raw in
+            if let base = raw.baseAddress {
+                dst.update(from: base.advanced(by: inBlock).assumingMemoryBound(to: UInt8.self), count: n)
+            }
+        }
+        var last = idx
+        while landingBlocks[last + 1] != nil { last += 1 }
+        let runEnd = last * blockSize + Int64(landingBlocks[last]?.count ?? 0)
+        return (n, runEnd)
     }
 
     /// Audit PERF-108: release detour blocks nothing has touched for `detourBlockIdleSeconds`, at most
@@ -4349,6 +4579,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
         lastDeliveryAt = DispatchTime.now()   // #309: the delivery-gap watchdog's only input
         genDeliveredBytes += Int64(data.count)
+        noteDeliveryForRateLocked(bytes: data.count, at: lastDeliveryAt)
         var firstDataMs: Double? = nil
         if !connFirstDataSeen {
             connFirstDataSeen = true
